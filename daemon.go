@@ -1,12 +1,9 @@
-//// +build !windows
-
 package daemon
 
 import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"github.com/golang/glog"
 	"io/ioutil"
 	"net"
 	"os"
@@ -15,6 +12,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+
+	"github.com/golang/glog"
 )
 
 // 响应
@@ -90,7 +89,7 @@ func (object *Daemon) spawnChildProcess(tcpLnFiles map[string]*os.File) (xCmdObj
 	raw, err = json.Marshal(tcpLnFds)
 	panicOnError(err)
 	xCmdObj.Args = append(xCmdObj.Args,
-		fmt.Sprintf("--%s%s=", object.bootstrapArgs, string(raw)))
+		fmt.Sprintf("--%s=%s", object.bootstrapArgs, string(raw)))
 
 	// 启动子进程
 	if err = xCmdObj.Start(); nil != err {
@@ -103,13 +102,17 @@ func (object *Daemon) spawnChildProcess(tcpLnFiles map[string]*os.File) (xCmdObj
 
 // Bootstrap 引导
 func (object *Daemon) Bootstrap(tcpPorts map[string]int, //TCP端口
-	logical func(tcpFds map[string]int), // 业务逻辑
+	logical func(tcpFds map[string]int, exitCh <-chan interface{}), // 业务逻辑
 	ready <-chan bool, // 准备好通道
 ) (err error) {
 	runInChild := flag.Bool(object.childCmd, false, "run in child")
 	runUpgrade := flag.Bool(object.upgradeCmd, false, "run upgrade")
 	bootstrapArgs := flag.String(object.bootstrapArgs, "", "bootstrap args")
 	flag.Parse()
+
+	// 等待信号
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh)
 
 	// 运行业务逻辑
 	if nil != runInChild && *runInChild {
@@ -125,19 +128,32 @@ func (object *Daemon) Bootstrap(tcpPorts map[string]int, //TCP端口
 
 		// 解析fd
 		tcpFds := make(map[string]int)
-		panicOnError(json.Unmarshal([]byte(*bootstrapArgs), tcpFds))
+		panicOnError(json.Unmarshal([]byte(*bootstrapArgs), &tcpFds))
 
 		// 调用业务逻辑
-		go logical(tcpFds)
+		exitCh := make(chan interface{}, 1)
+		go logical(tcpFds, exitCh)
 
 		// 等待准备好
 		ok := <-ready
 		if !ok {
 			glog.Error("logical ready not ok")
 			object.xCmdObj.ChildWrite([]byte(ReadyError))
-		} else {
-			object.xCmdObj.ChildWrite([]byte(ReadyOK))
+			return
 		}
+
+		// 回执启动成功
+		object.xCmdObj.ChildWrite([]byte(ReadyOK))
+
+		// 处理终止信号
+	childSignalLoop:
+		for s := range signalCh {
+			switch s {
+			case syscall.SIGINT, syscall.SIGTERM:
+				break childSignalLoop
+			}
+		}
+		close(exitCh)
 		return
 	}
 
@@ -146,7 +162,8 @@ func (object *Daemon) Bootstrap(tcpPorts map[string]int, //TCP端口
 		glog.Info("upgrade app")
 
 		// 读取PID
-		raw, err := ioutil.ReadFile(object.pidFile)
+		var raw []byte
+		raw, err = ioutil.ReadFile(object.pidFile)
 		if nil != err {
 			glog.Error(err)
 			return
@@ -262,9 +279,7 @@ func (object *Daemon) Bootstrap(tcpPorts map[string]int, //TCP端口
 	}()
 
 	// 等待信号
-	signalCh := make(chan os.Signal, 1)
-	signal.Notify(signalCh)
-loop:
+parentSignalLoop:
 	for s := range signalCh {
 		switch s {
 		case syscall.SIGINT, syscall.SIGTERM:
@@ -277,7 +292,7 @@ loop:
 				glog.Error(err)
 			}
 			object.wg.Wait()
-			break loop
+			break parentSignalLoop
 
 		case syscall.SIGUSR2:
 			glog.Infof("notify upgrade app")
@@ -290,7 +305,7 @@ loop:
 			}
 			// 等待子进程启动成功
 			ok := false
-			if err = object.xCmdObj.ParentRead(func(raw []byte) bool {
+			if err = newXCmdObj.ParentRead(func(raw []byte) bool {
 				request := string(raw)
 				switch request {
 				case ReadyOK:
@@ -311,7 +326,7 @@ loop:
 
 			// 启动子进程失败
 			if !ok {
-				break loop
+				break parentSignalLoop
 			}
 
 			glog.Info("notify old child exit")
