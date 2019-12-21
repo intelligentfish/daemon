@@ -18,8 +18,10 @@ import (
 
 // 响应
 const (
-	ReadyOK    = "ReadyOK"
-	ReadyError = "ReadyError"
+	ReadyOK     = "ReadyOK"
+	ReadyError  = "ReadyError"
+	ExitRequest = "Exit"
+	ExitReply   = ExitRequest
 )
 
 // panicOnError 错误崩溃
@@ -146,10 +148,12 @@ func (object *Daemon) replaceChildProcess(tcpLnFiles map[string]*os.File) (ok bo
 
 	if nil != object.xCmdObj {
 		glog.Info("notify old child exit")
+		// 发送停止指令
+		if err = object.waitChildSafeExit(); nil != err {
+			glog.Error(err)
+		}
 		object.xCmdObj.Process.Kill()
-
 		object.wg.Wait()
-
 		glog.Info("notify old child exit")
 		object.xCmdObj.Close()
 		object.xCmdObj = nil
@@ -192,10 +196,33 @@ func (object *Daemon) replaceChildProcess(tcpLnFiles map[string]*os.File) (ok bo
 	return
 }
 
+// waitChildSafeExit 等待子进程安全退出
+func (object *Daemon) waitChildSafeExit() (err error) {
+	if nil != object.xCmdObj {
+		if err = object.xCmdObj.ParentWrite([]byte(ExitRequest)); nil != err {
+			return
+		}
+		err = object.xCmdObj.ParentRead(func(raw []byte) bool {
+			if nil == raw || 0 >= len(raw) {
+				glog.Info("child request nil")
+				return false
+			}
+			request := string(raw)
+			switch request {
+			case ExitReply:
+				glog.Info("child request exit")
+				return false
+			}
+			return true
+		})
+	}
+	return
+}
+
 // runAsChild 运行于子程序
 func (object *Daemon) runAsChild(bootstrapArgs *string,
-	logical func(tcpFds map[string]int, exitCh <-chan interface{}), // 业务逻辑
-	ready <-chan bool, // 准备好通道
+	logical func(tcpFds map[string]int, exit /*退出*/ chan interface{}), // 业务逻辑
+	ready chan bool, // 准备好通道
 ) {
 	// 检查运行参数
 	if nil == bootstrapArgs || 0 >= len(*bootstrapArgs) {
@@ -211,34 +238,51 @@ func (object *Daemon) runAsChild(bootstrapArgs *string,
 	tcpFds := make(map[string]int)
 	panicOnError(json.Unmarshal([]byte(*bootstrapArgs), &tcpFds))
 
-	// 调用业务逻辑
+	// 等待完成
 	exitCh := make(chan interface{}, 1)
-	go logical(tcpFds, exitCh)
-
-	// 等待准备好
-	ok := <-ready
-	if !ok {
-		glog.Error("logical ready not ok")
-		object.xCmdObj.ChildWrite([]byte(ReadyError))
-		return
-	}
-
-	// 回执启动成功
-	object.xCmdObj.ChildWrite([]byte(ReadyOK))
-
-	// 等待信号
-	signalCh := make(chan os.Signal, 1)
-	signal.Notify(signalCh)
-
-	// 处理终止信号
-childSignalLoop:
-	for s := range signalCh {
-		switch s {
-		case syscall.SIGINT, syscall.SIGTERM:
-			break childSignalLoop
+	go func() {
+		// 等待准备好
+		ok := <-ready
+		if !ok {
+			glog.Error("logical ready not ok")
+			object.xCmdObj.ChildWrite([]byte(ReadyError))
+			return
 		}
-	}
-	close(exitCh)
+
+		// 回执启动成功
+		object.xCmdObj.ChildWrite([]byte(ReadyOK))
+
+		// 等待父进程发起退出命令
+		ok = true
+		err := object.xCmdObj.ChildRead(func(raw []byte) bool {
+			if nil == raw || 0 >= len(raw) {
+				// 父进程退了
+				ok = false
+				return false
+			}
+			request := string(raw)
+			switch request {
+			case ExitRequest:
+				ok = false
+				return false
+			}
+			return true
+		})
+		if nil != err {
+			glog.Error(err)
+		}
+		if !ok {
+			close(exitCh)
+			return
+		}
+	}()
+
+	// 让业务逻辑在主协程运行
+	// 调用业务逻辑
+	logical(tcpFds, exitCh)
+
+	// 通知守护进程，可以安全退出
+	object.xCmdObj.ChildWrite([]byte(ExitReply))
 }
 
 // runUpgrade 运行更新
@@ -276,8 +320,8 @@ func (object *Daemon) runUpgrade() {
 
 // Bootstrap 引导
 func (object *Daemon) Bootstrap(tcpPorts map[string]int, //TCP端口
-	logical func(tcpFds map[string]int, exitCh <-chan interface{}), // 业务逻辑
-	ready <-chan bool, // 准备好通道
+	logical func(tcpFds map[string]int, exitCh chan interface{}), // 业务逻辑
+	ready chan bool, // 准备好通道
 ) (err error) {
 	rebootTimes := flag.Int("reboot_times", 3, "")
 	runInChild := flag.Bool(object.childCmd, false, "run in child")
@@ -366,7 +410,10 @@ parentSignalLoop:
 
 			// 设置主动停服标志
 			atomic.StoreInt32(&object.killedFlag, 1)
-
+			// 发送停止指令
+			if err = object.waitChildSafeExit(); nil != err {
+				glog.Error(err)
+			}
 			// 发送信号，停止子进程
 			if err = object.xCmdObj.Process.Kill(); nil != err {
 				glog.Error(err)
@@ -378,10 +425,11 @@ parentSignalLoop:
 		case syscall.SIGUSR2:
 			glog.Infof("notify upgrade app")
 
+			// 设置更新标志
 			if !atomic.CompareAndSwapInt32(&object.upgradeFlag, 0, 1) {
 				return
 			}
-
+			// 替换子进程
 			ok, err = object.replaceChildProcess(tcpLnFiles)
 			if nil != err {
 				glog.Error(err)
@@ -392,6 +440,6 @@ parentSignalLoop:
 		}
 	}
 
-	glog.Info("app exited")
+	glog.Info("daemon exited")
 	return
 }

@@ -17,7 +17,7 @@ func main() {
 	daemon := daemon.Default()
 	daemon.Bootstrap(map[string]int{
 		"web": 10080,
-	}, func(tcpFds map[string]int, exitCh <-chan interface{}) {
+	}, func(tcpFds map[string]int, exitCh chan interface{}) {
 		engine := gin.Default()
 		engine.GET("/pid", func(ctx *gin.Context) {
 			ctx.String(http.StatusOK, fmt.Sprintf("pid:%d\n", os.Getpid()))
@@ -44,5 +44,6 @@ func main() {
 		if err = engine.RunListener(listener); nil != err {
 			glog.Error(err)
 		}
+		glog.Error("app exited")
 	}, ready)
 }

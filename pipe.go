@@ -137,5 +137,8 @@ func (object *XPipe) Read(callback func(data []byte) bool) (err error) {
 			}
 		}
 	}
+	if flag {
+		callback(nil)
+	}
 	return
 }
