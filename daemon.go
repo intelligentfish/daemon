@@ -31,6 +31,9 @@ func panicOnError(err error) {
 
 // Daemon 守护进程
 type Daemon struct {
+	sync.RWMutex
+	rebootTimes     int            // 最大重启次数
+	upgradeFlag     int32          // 正常更新标志
 	killedFlag      int32          // 正常停服标志
 	origArgs        []string       // 程序原始运行参数
 	wg              sync.WaitGroup // 等待组
@@ -46,6 +49,7 @@ type Daemon struct {
 // New 工厂方法
 func New(childCmd, upgradeCmd, bootstrapArgs, bootstrapLogDir, pidFile string) *Daemon {
 	return &Daemon{
+		rebootTimes:     3,
 		childCmd:        childCmd,
 		upgradeCmd:      upgradeCmd,
 		bootstrapArgs:   bootstrapArgs,
@@ -100,11 +104,182 @@ func (object *Daemon) spawnChildProcess(tcpLnFiles map[string]*os.File) (xCmdObj
 	return
 }
 
+// replaceChildProcess 重启子进程
+func (object *Daemon) replaceChildProcess(tcpLnFiles map[string]*os.File) (ok bool, err error) {
+	object.Lock()
+	defer object.Unlock()
+
+	var newXCmdObj *XCmd
+	newXCmdObj, err = object.spawnChildProcess(tcpLnFiles)
+	if nil != err {
+		glog.Error(err)
+		return
+	}
+
+	// 等待子进程启动成功
+	ok = false
+	if err = newXCmdObj.ParentRead(func(raw []byte) bool {
+		request := string(raw)
+		switch request {
+		case ReadyOK:
+			glog.Info("child ready ok")
+			ok = true
+			return false
+
+		case ReadyError:
+			glog.Error("child ready error")
+			return false
+
+		default:
+			return true
+		}
+	}); nil != err {
+		glog.Error(err)
+	}
+
+	// 启动子进程失败
+	if !ok {
+		newXCmdObj.Close()
+		newXCmdObj = nil
+		return
+	}
+
+	if nil != object.xCmdObj {
+		glog.Info("notify old child exit")
+		object.xCmdObj.Process.Kill()
+
+		object.wg.Wait()
+
+		glog.Info("notify old child exit")
+		object.xCmdObj.Close()
+		object.xCmdObj = nil
+	}
+
+	glog.Infof("wait new child")
+	object.xCmdObj = newXCmdObj
+	object.wg.Add(1)
+	go func() {
+		defer object.wg.Done()
+
+		if err = object.xCmdObj.Wait(); nil != err {
+			glog.Error(err)
+		}
+		if atomic.CompareAndSwapInt32(&object.upgradeFlag, 1, 0) {
+			// 正常更新流程
+			glog.Infof("child: %d done", object.xCmdObj.Process.Pid)
+			return
+		}
+
+		if 0 == atomic.LoadInt32(&object.killedFlag) {
+			// 最大失败重试，直接退出
+			object.rebootTimes--
+			glog.Errorf("child: %d done unexpected, reboot times countdown: %d",
+				object.xCmdObj.Process.Pid,
+				object.rebootTimes)
+			if 0 > object.rebootTimes {
+				os.Exit(-1)
+				return
+			}
+
+			object.xCmdObj.Process.Release()
+			object.xCmdObj.Close()
+			object.xCmdObj = nil
+			object.replaceChildProcess(tcpLnFiles)
+		} else {
+			glog.Infof("child: %d done", object.xCmdObj.Process.Pid)
+		}
+	}()
+	return
+}
+
+// runAsChild 运行于子程序
+func (object *Daemon) runAsChild(bootstrapArgs *string,
+	logical func(tcpFds map[string]int, exitCh <-chan interface{}), // 业务逻辑
+	ready <-chan bool, // 准备好通道
+) {
+	// 检查运行参数
+	if nil == bootstrapArgs || 0 >= len(*bootstrapArgs) {
+		glog.Error("bootstrap argument is empty")
+		return
+	}
+
+	// 获取通信对象
+	object.xCmdObj = XCmdFromFd(3, 4)
+	defer object.xCmdObj.Close()
+
+	// 解析fd
+	tcpFds := make(map[string]int)
+	panicOnError(json.Unmarshal([]byte(*bootstrapArgs), &tcpFds))
+
+	// 调用业务逻辑
+	exitCh := make(chan interface{}, 1)
+	go logical(tcpFds, exitCh)
+
+	// 等待准备好
+	ok := <-ready
+	if !ok {
+		glog.Error("logical ready not ok")
+		object.xCmdObj.ChildWrite([]byte(ReadyError))
+		return
+	}
+
+	// 回执启动成功
+	object.xCmdObj.ChildWrite([]byte(ReadyOK))
+
+	// 等待信号
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh)
+
+	// 处理终止信号
+childSignalLoop:
+	for s := range signalCh {
+		switch s {
+		case syscall.SIGINT, syscall.SIGTERM:
+			break childSignalLoop
+		}
+	}
+	close(exitCh)
+}
+
+// runUpgrade 运行更新
+func (object *Daemon) runUpgrade() {
+	glog.Info("upgrade app")
+
+	// 读取PID
+	raw, err := ioutil.ReadFile(object.pidFile)
+	if nil != err {
+		glog.Error(err)
+		return
+	}
+
+	var pid int
+	if pid, err = strconv.Atoi(string(raw)); nil != err {
+		glog.Error(err)
+		return
+	}
+
+	// 查找进程
+	var p *os.Process
+	if p, err = os.FindProcess(pid); nil != err {
+		glog.Error(err)
+		return
+	}
+
+	// 通知更新
+	if nil != p {
+		if err = p.Signal(syscall.SIGUSR2); nil != err {
+			glog.Error(err)
+			return
+		}
+	}
+}
+
 // Bootstrap 引导
 func (object *Daemon) Bootstrap(tcpPorts map[string]int, //TCP端口
 	logical func(tcpFds map[string]int, exitCh <-chan interface{}), // 业务逻辑
 	ready <-chan bool, // 准备好通道
 ) (err error) {
+	rebootTimes := flag.Int("reboot_times", 3, "")
 	runInChild := flag.Bool(object.childCmd, false, "run in child")
 	runUpgrade := flag.Bool(object.upgradeCmd, false, "run upgrade")
 	bootstrapArgs := flag.String(object.bootstrapArgs, "", "bootstrap args")
@@ -116,80 +291,19 @@ func (object *Daemon) Bootstrap(tcpPorts map[string]int, //TCP端口
 
 	// 运行业务逻辑
 	if nil != runInChild && *runInChild {
-		// 检查运行参数
-		if nil == bootstrapArgs || 0 >= len(*bootstrapArgs) {
-			glog.Error("bootstrap argument is empty")
-			return
-		}
-
-		// 获取通信对象
-		object.xCmdObj = XCmdFromFd(3, 4)
-		defer object.xCmdObj.Close()
-
-		// 解析fd
-		tcpFds := make(map[string]int)
-		panicOnError(json.Unmarshal([]byte(*bootstrapArgs), &tcpFds))
-
-		// 调用业务逻辑
-		exitCh := make(chan interface{}, 1)
-		go logical(tcpFds, exitCh)
-
-		// 等待准备好
-		ok := <-ready
-		if !ok {
-			glog.Error("logical ready not ok")
-			object.xCmdObj.ChildWrite([]byte(ReadyError))
-			return
-		}
-
-		// 回执启动成功
-		object.xCmdObj.ChildWrite([]byte(ReadyOK))
-
-		// 处理终止信号
-	childSignalLoop:
-		for s := range signalCh {
-			switch s {
-			case syscall.SIGINT, syscall.SIGTERM:
-				break childSignalLoop
-			}
-		}
-		close(exitCh)
+		object.runAsChild(bootstrapArgs, logical, ready)
 		return
 	}
 
 	// 运行更新程序
 	if nil != runUpgrade && *runUpgrade {
-		glog.Info("upgrade app")
-
-		// 读取PID
-		var raw []byte
-		raw, err = ioutil.ReadFile(object.pidFile)
-		if nil != err {
-			glog.Error(err)
-			return
-		}
-
-		var pid int
-		if pid, err = strconv.Atoi(string(raw)); nil != err {
-			glog.Error(err)
-			return
-		}
-
-		// 查找进程
-		var p *os.Process
-		if p, err = os.FindProcess(pid); nil != err {
-			glog.Error(err)
-			return
-		}
-
-		// 通知更新
-		if nil != p {
-			if err = p.Signal(syscall.SIGUSR2); nil != err {
-				glog.Error(err)
-				return
-			}
-		}
+		object.runUpgrade()
 		return
+	}
+
+	// 解析最大重启次数
+	if nil != rebootTimes {
+		object.rebootTimes = *rebootTimes
 	}
 
 	// 保存原始运行参数
@@ -228,55 +342,20 @@ func (object *Daemon) Bootstrap(tcpPorts map[string]int, //TCP端口
 		tcpLnFiles[uniqueName] = lnFile
 	}
 
-	// 启动进程
-	object.xCmdObj, err = object.spawnChildProcess(tcpLnFiles)
+	var ok bool
+	ok, err = object.replaceChildProcess(tcpLnFiles)
+	if !ok {
+		return
+	}
+
 	if nil != err {
 		glog.Error(err)
 		return
 	}
 
-	defer object.xCmdObj.Close()
-
-	// 等待子进程启动成功
-	ok := false
-	if err = object.xCmdObj.ParentRead(func(raw []byte) bool {
-		request := string(raw)
-		switch request {
-		case ReadyOK:
-			glog.Info("child ready ok")
-			ok = true
-			return false
-
-		case ReadyError:
-			glog.Error("child ready error")
-			return false
-
-		default:
-			return true
-		}
-	}); nil != err {
-		glog.Error(err)
+	if nil != object.xCmdObj {
+		defer object.xCmdObj.Close()
 	}
-
-	// 启动子进程失败
-	if !ok {
-		return
-	}
-
-	// 等待进程退出
-	object.wg.Add(1)
-	go func() {
-		defer object.wg.Done()
-		if err = object.xCmdObj.Wait(); nil != err {
-			glog.Error(err)
-		}
-		if 0 == atomic.LoadInt32(&object.killedFlag) {
-			glog.Errorf("child: %d done", object.xCmdObj.Process.Pid)
-			//TODO 子进程意外死亡,重启子进程
-		} else {
-			glog.Infof("child: %d done", object.xCmdObj.Process.Pid)
-		}
-	}()
 
 	// 等待信号
 parentSignalLoop:
@@ -287,72 +366,29 @@ parentSignalLoop:
 
 			// 设置主动停服标志
 			atomic.StoreInt32(&object.killedFlag, 1)
+
 			// 发送信号，停止子进程
 			if err = object.xCmdObj.Process.Kill(); nil != err {
 				glog.Error(err)
 			}
 			object.wg.Wait()
+
 			break parentSignalLoop
 
 		case syscall.SIGUSR2:
 			glog.Infof("notify upgrade app")
 
-			var newXCmdObj *XCmd
-			newXCmdObj, err = object.spawnChildProcess(tcpLnFiles)
-			if nil != err {
-				glog.Error(err)
+			if !atomic.CompareAndSwapInt32(&object.upgradeFlag, 0, 1) {
 				return
 			}
-			// 等待子进程启动成功
-			ok := false
-			if err = newXCmdObj.ParentRead(func(raw []byte) bool {
-				request := string(raw)
-				switch request {
-				case ReadyOK:
-					glog.Info("child ready ok")
-					ok = true
-					return false
 
-				case ReadyError:
-					glog.Error("child ready error")
-					return false
-
-				default:
-					return true
-				}
-			}); nil != err {
+			ok, err = object.replaceChildProcess(tcpLnFiles)
+			if nil != err {
 				glog.Error(err)
 			}
-
-			// 启动子进程失败
-			if !ok {
+			if !ok || nil != err {
 				break parentSignalLoop
 			}
-
-			glog.Info("notify old child exit")
-
-			object.xCmdObj.Process.Kill()
-			object.wg.Wait()
-
-			glog.Info("notify old child exit")
-
-			object.xCmdObj.Close()
-
-			glog.Infof("wait new child")
-			object.xCmdObj = newXCmdObj
-			object.wg.Add(1)
-			go func() {
-				defer object.wg.Done()
-				if err = object.xCmdObj.Wait(); nil != err {
-					glog.Error(err)
-				}
-				if 0 == atomic.LoadInt32(&object.killedFlag) {
-					glog.Errorf("child: %d done", object.xCmdObj.Process.Pid)
-					//TODO 子进程意外死亡,重启子进程
-				} else {
-					glog.Infof("child: %d done", object.xCmdObj.Process.Pid)
-				}
-			}()
 		}
 	}
 
