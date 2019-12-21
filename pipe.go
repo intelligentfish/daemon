@@ -130,11 +130,11 @@ func (object *XPipe) Read(callback func(data []byte) bool) (err error) {
 			}
 			readBuf.SetReadIndex(readBuf.GetReadIndex() + 4)
 			flag = callback(readBuf.Slice(chunkSize))
+			readBuf.SetReadIndex(readBuf.GetReadIndex() + chunkSize)
+			readBuf.DiscardReadBytes()
 			if !flag {
 				break
 			}
-			readBuf.SetReadIndex(readBuf.GetReadIndex() + chunkSize)
-			readBuf.DiscardReadBytes()
 		}
 	}
 	return
