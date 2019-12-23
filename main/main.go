@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"daemon"
 	"fmt"
 	"net"
@@ -25,8 +26,9 @@ func main() {
 		})
 
 		// 模拟耗时的操作...
-		time.Sleep(10 * time.Second)
+		time.Sleep(1 * time.Second)
 
+		// 获取文件描述符
 		fd := tcpFds["web"]
 		f := os.NewFile(uintptr(fd), "web")
 		listener, err := net.FileListener(f)
@@ -35,14 +37,27 @@ func main() {
 			glog.Error(err)
 			return
 		}
-
 		defer listener.Close()
+
+		// 创建HTTP服务器
+		srv := &http.Server{Handler: engine}
+		defer srv.Close()
+
+		// 准备好
 		ready <- true
+
+		// 等待服务退出
 		go func() {
 			<-exitCh
-			listener.Close()
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := srv.Shutdown(ctx); err != nil {
+				glog.Error("server Shutdown: ", err)
+			}
 		}()
-		if err = engine.RunListener(listener); nil != err {
+
+		// 开启HTTP服务器
+		if err = srv.Serve(listener); nil != err {
 			glog.Error(err)
 		}
 
