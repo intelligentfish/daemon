@@ -256,17 +256,14 @@ func (object *Daemon) runAsChild(bootstrapArgs *string,
 		object.xCmdObj.ChildWrite([]byte(ReadyOK))
 
 		// 等待父进程发起退出命令
-		ok = true
 		err := object.xCmdObj.ChildRead(func(raw []byte) bool {
 			if nil == raw || 0 >= len(raw) {
 				// 父进程退了
-				ok = false
 				return false
 			}
 			request := string(raw)
 			switch request {
 			case ExitRequest:
-				ok = false
 				return false
 			}
 			return true
@@ -274,10 +271,7 @@ func (object *Daemon) runAsChild(bootstrapArgs *string,
 		if nil != err {
 			glog.Error(err)
 		}
-		if !ok {
-			close(exitCh)
-			return
-		}
+		close(exitCh)
 	}()
 
 	// 让业务逻辑在主协程运行
