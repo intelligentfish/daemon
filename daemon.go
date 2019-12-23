@@ -221,8 +221,9 @@ func (object *Daemon) waitChildSafeExit() (err error) {
 
 // runAsChild 运行于子程序
 func (object *Daemon) runAsChild(bootstrapArgs *string,
-	logical func(tcpFds map[string]int, exit /*退出*/ chan interface{}), // 业务逻辑
-	ready chan bool, // 准备好通道
+	logical func(tcpFds map[string]int,
+		ready chan bool, /*准备好通道*/
+		exit /*退出*/ chan interface{}), // 业务逻辑
 ) {
 	// 检查运行参数
 	if nil == bootstrapArgs || 0 >= len(*bootstrapArgs) {
@@ -238,6 +239,8 @@ func (object *Daemon) runAsChild(bootstrapArgs *string,
 	tcpFds := make(map[string]int)
 	panicOnError(json.Unmarshal([]byte(*bootstrapArgs), &tcpFds))
 
+	// 准备好
+	ready := make(chan bool, 1)
 	// 等待完成
 	exitCh := make(chan interface{}, 1)
 	go func() {
@@ -279,7 +282,7 @@ func (object *Daemon) runAsChild(bootstrapArgs *string,
 
 	// 让业务逻辑在主协程运行
 	// 调用业务逻辑
-	logical(tcpFds, exitCh)
+	logical(tcpFds, ready, exitCh)
 
 	// 通知守护进程，可以安全退出
 	object.xCmdObj.ChildWrite([]byte(ExitReply))
@@ -320,8 +323,9 @@ func (object *Daemon) runUpgrade() {
 
 // Bootstrap 引导
 func (object *Daemon) Bootstrap(tcpPorts map[string]int, //TCP端口
-	logical func(tcpFds map[string]int, exitCh chan interface{}), // 业务逻辑
-	ready chan bool, // 准备好通道
+	logical func(tcpFds map[string]int,
+		ready chan bool, /*准备好通道*/
+		exitCh chan interface{} /*退出通道*/), // 业务逻辑
 ) (err error) {
 	rebootTimes := flag.Int("reboot_times", 3, "")
 	runInChild := flag.Bool(object.childCmd, false, "run in child")
@@ -335,7 +339,7 @@ func (object *Daemon) Bootstrap(tcpPorts map[string]int, //TCP端口
 
 	// 运行业务逻辑
 	if nil != runInChild && *runInChild {
-		object.runAsChild(bootstrapArgs, logical, ready)
+		object.runAsChild(bootstrapArgs, logical)
 		return
 	}
 
